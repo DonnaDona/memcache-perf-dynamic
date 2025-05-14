@@ -14,6 +14,12 @@
 
 using namespace std;
 
+#define printf(...) do { \
+        printf(__VA_ARGS__); \
+        fflush(stdout);  \
+        fflush(stderr); \
+        } while (0)
+
 #ifdef STATIC_ALLOC_SAMPLER
 // Static allocation
 

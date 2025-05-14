@@ -45,6 +45,12 @@
 
 #define MIN(a,b) ((a) < (b) ? (a) : (b))
 
+#define printf(...) do { \
+        printf(__VA_ARGS__); \
+        fflush(stdout);  \
+        fflush(stderr); \
+        } while (0)
+
 using namespace std;
 using namespace std::chrono;
 
