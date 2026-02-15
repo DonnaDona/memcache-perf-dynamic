@@ -549,6 +549,8 @@ void agent() {
       }
 
       string req = s_recv(socket);
+      if (req == "FAIL-RECV")
+        break;
       request.rebuild(sizeof(as));
       memcpy(request.data(), &as, sizeof(as));
       socket.send(request);
@@ -578,17 +580,23 @@ void agent() {
       }
 
       string req = s_recv(socket);
+      if (req == "FAIL-RECV")
+        break;
       request.rebuild(sizeof(as.bs));
       memcpy(request.data(), &(as.bs), sizeof(as.bs));
       socket.send(request);
 
       req = s_recv(socket);
+      if (req == "FAIL-RECV")
+        break;
       request.rebuild(options.n_intervals * sizeof(uint64_t));
       memcpy(request.data(), as.gets_dyn,
              options.n_intervals * sizeof(uint64_t));
       socket.send(request);
 
       req = s_recv(socket);
+      if (req == "FAIL-RECV")
+        break;
       request.rebuild(options.n_intervals * sizeof(uint64_t));
       memcpy(request.data(), as.sets_dyn,
              options.n_intervals * sizeof(uint64_t));
@@ -596,6 +604,8 @@ void agent() {
 
       for (int j = 0; j < options.n_intervals; j++) {
         req = s_recv(socket);
+        if (req == "FAIL-RECV")
+          break;
         request.rebuild(LOGSAMPLER_BINS * sizeof(uint64_t));
         memcpy(request.data(), as.get_bins[j],
                LOGSAMPLER_BINS * sizeof(uint64_t));
@@ -603,11 +613,15 @@ void agent() {
       }
 
       req = s_recv(socket);
+      if (req == "FAIL-RECV")
+        break;
       request.rebuild(options.n_intervals * sizeof(double));
       memcpy(request.data(), as.get_sum, options.n_intervals * sizeof(double));
       socket.send(request);
 
       req = s_recv(socket);
+      if (req == "FAIL-RECV")
+        break;
       request.rebuild(options.n_intervals * sizeof(uint64_t));
       memcpy(request.data(), as.get_sum_sq,
              options.n_intervals * sizeof(double));
@@ -639,7 +653,6 @@ void agent() {
 // ----------------------------------------------------------------------------------------------------
 void finish_agent(ConnectionStats &stats, int n_intervals) {
   int aid = 0;
-  // for (auto s: agent_sockets) {
   vector<zmq::socket_t *>::iterator its;
   for (its = agent_sockets.begin(); its != agent_sockets.end(); its++) {
     zmq::socket_t *s = *its;
@@ -647,55 +660,74 @@ void finish_agent(ConnectionStats &stats, int n_intervals) {
     bool status;
 
 #ifdef STATIC_ALLOC_SAMPLER
-    // Static allocation
     AgentStats as = AgentStats();
     zmq::message_t message;
 
     status = s_send(*s, "stats");
-    D("Agent %d finish send = %s", aid, status ? "true" : "false");
+    if (!status)
+      continue;
     status = poll_recv(*s, &message);
+    if (!status)
+      continue;
     memcpy(&as, message.data(), sizeof(as));
-    D("Agent %d finish recv = %s", aid, status ? "true" : "false");
 #else
-    // Dynamic allocation
     AgentStats as = AgentStats(n_intervals);
     zmq::message_t message;
 
     status = s_send(*s, "stats");
+    if (!status)
+      continue;
     status = poll_recv(*s, &message);
+    if (!status)
+      continue;
     memcpy(&(as.bs), message.data(), sizeof(as.bs));
 
     status = s_send(*s, "gets_dyn");
+    if (!status)
+      continue;
     status = poll_recv(*s, &message);
+    if (!status)
+      continue;
     memcpy(as.gets_dyn, message.data(), n_intervals * sizeof(uint64_t));
 
     status = s_send(*s, "sets_dyn");
+    if (!status)
+      continue;
     status = poll_recv(*s, &message);
+    if (!status)
+      continue;
     memcpy(as.sets_dyn, message.data(), n_intervals * sizeof(uint64_t));
 
     for (int i = 0; i < n_intervals; i++) {
-      status = s_send(*s, "bins" + i);
+      status = s_send(*s, "bins" + std::to_string(i));
+      if (!status)
+        break;
       status = poll_recv(*s, &message);
+      if (!status)
+        break;
       memcpy(as.get_bins[i], message.data(),
              LOGSAMPLER_BINS * sizeof(uint64_t));
     }
+    if (!status)
+      continue;
 
     status = s_send(*s, "sum");
+    if (!status)
+      continue;
     status = poll_recv(*s, &message);
+    if (!status)
+      continue;
     memcpy(as.get_sum, message.data(), n_intervals * sizeof(double));
 
     status = s_send(*s, "sum_sq");
+    if (!status)
+      continue;
     status = poll_recv(*s, &message);
+    if (!status)
+      continue;
     memcpy(as.get_sum_sq, message.data(), n_intervals * sizeof(double));
 
-    // std::cout << "RECEIVED" << std::endl;
-    // as.print_base();
-    // as.print_dyn();
-    // as.print_bins();
-    // as.print_sum();
-
 #endif
-    // Finally accumulate
     stats.accumulate(as);
   }
 }
