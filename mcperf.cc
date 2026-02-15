@@ -46,10 +46,7 @@
 
 volatile sig_atomic_t keep_running = 1;
 
-void sig_handler(int signum) {
-  keep_running = 0;
-  printf("Signal %d received, shutting down...\n", signum);
-}
+void sig_handler(int signum) { keep_running = 0; }
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
