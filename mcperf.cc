@@ -46,7 +46,10 @@
 
 volatile sig_atomic_t keep_running = 1;
 
-void sig_handler(int signum) { keep_running = 0; }
+void sig_handler(int signum) {
+  keep_running = 0;
+  printf("Signal %d received, shutting down...\n", signum);
+}
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
@@ -153,69 +156,48 @@ void deTokenize(string &str, const vector<string> &tokens,
 bool poll_recv(zmq::socket_t &socket, zmq::message_t *msg) {
   unsigned int timer = max_poll_time;
   bool status = false;
-  D("- recv");
-  // if no timeout, just block
   if (timer == 0) {
-    return socket.recv(msg);
+    try {
+      return socket.recv(msg);
+    } catch (const zmq::error_t &e) {
+      if (e.num() == EINTR)
+        return false;
+      throw;
+    }
   }
-  // otherwise, recv non blocking until timeout passed
   int itid = 0;
   struct timespec st;
   st.tv_sec = poll_interval_s;
   st.tv_nsec = 0;
   do {
     itid++;
-    status = socket.recv(msg, noblock_flag);
+    try {
+      status = socket.recv(msg, noblock_flag);
+    } catch (const zmq::error_t &e) {
+      if (e.num() == EINTR)
+        return false;
+      throw;
+    }
     if (status)
       return status;
-    // if failed, check errno for fail reason
     if (zmq_errno() == EAGAIN) {
-      // if failed just bcs msg non blocking, try again after sleeping for poll
-      // interval
       nanosleep(&st, NULL);
       timer -= poll_interval_s;
     } else {
-      W("ERROR in socket! [%d]", zmq_errno());
       break;
     }
-    if ((itid & 0xff) == 0) {
-      V("Socket recv multi iterate..."); // TODO:DBG
-    }
-  } while (timer > poll_interval_s);
-  W("Failed to recv within requested time limit. Aborting recv.");
+  } while (timer > poll_interval_s && keep_running);
   return false;
 }
 
 bool poll_send(zmq::socket_t &socket, zmq::message_t &msg) {
-  unsigned int timer = max_poll_time;
-  bool status = false;
-  D("- send");
-  // if no timeout, just block
-#if 1
-  return socket.send(msg);
-#else
-  if (timer == 0) {
+  try {
     return socket.send(msg);
+  } catch (const zmq::error_t &e) {
+    if (e.num() == EINTR)
+      return false;
+    throw;
   }
-  // otherwise, recv non blocking until timeout passed
-  do {
-    status = socket.send(msg, noblock_flag);
-    if (status == 0)
-      return status;
-    // if failed, check errno for fail reason
-    if (zmq_errno() == EAGAIN) {
-      // if failed just bcs msg non blocking, try again after sleeping for poll
-      // interval
-      usleep(poll_interval_us);
-      timer -= poll_interval_us;
-    } else {
-      W("ERROR in socket! [%d]", zmq_errno());
-      break;
-    }
-  } while (timer > poll_interval_us);
-  W("Failed to send within requested time limit. Aborting send.");
-  return false;
-#endif
 }
 
 static std::string s_recv(zmq::socket_t &socket) {
@@ -484,194 +466,172 @@ void agent() {
 
   int lid = 0;
   while (keep_running) {
-    zmq::message_t request;
+    try {
+      zmq::message_t request;
 
-    socket.recv(&request);
-    lid++;
-
-    zmq::message_t num(sizeof(int));
-    *((int *)num.data()) = args.threads_arg * args.lambda_mul_arg;
-    socket.send(num);
-    V("sent num %d", lid);
-    options_t options;
-    memcpy(&options, request.data(), sizeof(options));
-    V("Got options: %d %s", options.connections,
-      options.loadonly ? "loadonly"
-      : options.noload ? "noload"
-                       : "");
-
-    // get a string containing the servers, and parse it to extract all servers
-    string server_opt = s_recv(socket);
-    vector<string> servers;
-    tokenize(server_opt, servers);
-    s_send(socket, "ack");
-    V("sent ack");
-    vector<string>::iterator i;
-
-    for (i = servers.begin(); i != servers.end(); i++) {
-      V("Got server = %s", i->c_str());
-    }
-
-    options.threads = args.threads_arg;
-
-    // Get the dynamic QPS
-    options.dyn_agent = options.dyn_en;
-    if (options.dyn_en) {
       socket.recv(&request);
-      options.qps_dyn = new int[options.n_intervals];
-      memcpy((void *)options.qps_dyn, request.data(),
-             options.n_intervals * sizeof(int));
+      lid++;
+
+      zmq::message_t num(sizeof(int));
+      *((int *)num.data()) = args.threads_arg * args.lambda_mul_arg;
+      socket.send(num);
+      options_t options;
+      memcpy(&options, request.data(), sizeof(options));
+
+      string server_opt = s_recv(socket);
+      vector<string> servers;
+      tokenize(server_opt, servers);
+      s_send(socket, "ack");
+      vector<string>::iterator i;
+
+      for (i = servers.begin(); i != servers.end(); i++) {
+      }
+
+      options.threads = args.threads_arg;
+
+      options.dyn_agent = options.dyn_en;
+      if (options.dyn_en) {
+        socket.recv(&request);
+        options.qps_dyn = new int[options.n_intervals];
+        memcpy((void *)options.qps_dyn, request.data(),
+               options.n_intervals * sizeof(int));
+        s_send(socket, "THANKS");
+      }
+
+      socket.recv(&request);
+      options.lambda_denom = *((int *)request.data());
       s_send(socket, "THANKS");
-      V("sent tnx 1");
-    }
 
-    // Get lambda adjusted
-    socket.recv(&request);
-    options.lambda_denom = *((int *)request.data());
-    s_send(socket, "THANKS");
-    V("sent tnx 2");
+      if (options.dyn_agent) {
+        options.lambda = (double)options.qps_min / options.lambda_denom *
+                         args.lambda_mul_arg;
 
-    // Adjust lambda
-    if (options.dyn_agent) {
-      options.lambda =
-          (double)options.qps_min / options.lambda_denom * args.lambda_mul_arg;
+        options.lambda_dyn = new double[options.n_intervals];
+        for (int j = 0; j < options.n_intervals; j++)
+          options.lambda_dyn[j] = (double)options.qps_dyn[j] /
+                                  options.lambda_denom * args.lambda_mul_arg;
 
-      // Dynamic lambdas
-      options.lambda_dyn = new double[options.n_intervals];
-      for (int i = 0; i < options.n_intervals; i++)
-        options.lambda_dyn[i] = (double)options.qps_dyn[i] /
-                                options.lambda_denom * args.lambda_mul_arg;
+      } else {
+        options.lambda =
+            (double)options.qps / options.lambda_denom * args.lambda_mul_arg;
+      }
 
-    } else {
-      options.lambda =
-          (double)options.qps / options.lambda_denom * args.lambda_mul_arg;
-    }
+      pthread_barrier_init(&barrier, NULL, options.threads);
 
-    V("lambda_denom = %d, lambda = %f, qps = %d, qps_min = %d, qps_max = %d,",
-      options.lambda_denom, options.lambda, options.qps, options.qps_min,
-      options.qps_max);
+      ConnectionStats stats = ConnectionStats(true, options.n_intervals);
 
-    // Barrier
-    pthread_barrier_init(&barrier, NULL, options.threads);
+      uint64_t start, end;
+      go(servers, options, stats, start, end, &socket);
 
-    ConnectionStats stats = ConnectionStats(true, options.n_intervals);
-
-    V("launching go");
-    // Run
-    uint64_t start, end;
-    go(servers, options, stats, start, end, &socket);
-
-    V("Done run.");
-    // Run done. Send the stats back to the master.
 #ifdef STATIC_ALLOC_SAMPLER
-    AgentStats as = AgentStats();
+      AgentStats as = AgentStats();
 
-    as.rx_bytes = stats.rx_bytes;
-    as.tx_bytes = stats.tx_bytes;
-    as.gets = stats.gets;
-    as.sets = stats.sets;
-    as.get_misses = stats.get_misses;
-    as.start = stats.start;
-    as.stop = stats.stop;
-    as.skips = stats.skips;
+      as.rx_bytes = stats.rx_bytes;
+      as.tx_bytes = stats.tx_bytes;
+      as.gets = stats.gets;
+      as.sets = stats.sets;
+      as.get_misses = stats.get_misses;
+      as.start = stats.start;
+      as.stop = stats.stop;
+      as.skips = stats.skips;
 
-    for (int i = 0; i < options.n_intervals; i++) {
-      as.gets_dyn[i] = stats.gets_dyn[i];
-      as.sets_dyn[i] = stats.sets_dyn[i];
-    }
-
-    for (int i = 0; i < options.n_intervals; i++) {
-      for (int j = 0; j < LOGSAMPLER_BINS; j++) {
-        as.get_bins[i][j] = stats.get_sampler.bins[i][j];
+      for (int j = 0; j < options.n_intervals; j++) {
+        as.gets_dyn[j] = stats.gets_dyn[j];
+        as.sets_dyn[j] = stats.sets_dyn[j];
       }
-      as.get_sum[i] = stats.get_sampler.sum[i];
-      as.get_sum_sq[i] = stats.get_sampler.sum_sq[i];
-    }
 
-    // Send to master
-    string req = s_recv(socket);
-    V("req = %s", req.c_str());
-    request.rebuild(sizeof(as));
-    memcpy(request.data(), &as, sizeof(as));
-    socket.send(request);
-    V("send = %s", req.c_str());
-#else
-    AgentStats as = AgentStats(options.n_intervals);
-
-    as.bs.rx_bytes = stats.rx_bytes;
-    as.bs.tx_bytes = stats.tx_bytes;
-    as.bs.gets = stats.gets;
-    as.bs.sets = stats.sets;
-    as.bs.get_misses = stats.get_misses;
-    as.bs.start = stats.start;
-    as.bs.stop = stats.stop;
-    as.bs.skips = stats.skips;
-
-    for (int i = 0; i < options.n_intervals; i++) {
-      as.gets_dyn[i] = stats.gets_dyn[i];
-      as.sets_dyn[i] = stats.sets_dyn[i];
-    }
-
-    for (int i = 0; i < options.n_intervals; i++) {
-      for (int j = 0; j < LOGSAMPLER_BINS; j++) {
-        as.get_bins[i][j] = stats.get_sampler.bins[i][j];
+      for (int j = 0; j < options.n_intervals; j++) {
+        for (int k = 0; k < LOGSAMPLER_BINS; k++) {
+          as.get_bins[j][k] = stats.get_sampler.bins[j][k];
+        }
+        as.get_sum[j] = stats.get_sampler.sum[j];
+        as.get_sum_sq[j] = stats.get_sampler.sum_sq[j];
       }
-      as.get_sum[i] = stats.get_sampler.sum[i];
-      as.get_sum_sq[i] = stats.get_sampler.sum_sq[i];
-    }
 
-    // Send to master
-    string req = s_recv(socket);
-    request.rebuild(sizeof(as.bs));
-    memcpy(request.data(), &(as.bs), sizeof(as.bs));
-    socket.send(request);
-
-    req = s_recv(socket);
-    request.rebuild(options.n_intervals * sizeof(uint64_t));
-    memcpy(request.data(), as.gets_dyn, options.n_intervals * sizeof(uint64_t));
-    socket.send(request);
-
-    req = s_recv(socket);
-    request.rebuild(options.n_intervals * sizeof(uint64_t));
-    memcpy(request.data(), as.sets_dyn, options.n_intervals * sizeof(uint64_t));
-    socket.send(request);
-
-    for (int i = 0; i < options.n_intervals; i++) {
-      req = s_recv(socket);
-      request.rebuild(LOGSAMPLER_BINS * sizeof(uint64_t));
-      memcpy(request.data(), as.get_bins[i],
-             LOGSAMPLER_BINS * sizeof(uint64_t));
+      string req = s_recv(socket);
+      request.rebuild(sizeof(as));
+      memcpy(request.data(), &as, sizeof(as));
       socket.send(request);
-    }
+#else
+      AgentStats as = AgentStats(options.n_intervals);
 
-    req = s_recv(socket);
-    request.rebuild(options.n_intervals * sizeof(double));
-    memcpy(request.data(), as.get_sum, options.n_intervals * sizeof(double));
-    socket.send(request);
+      as.bs.rx_bytes = stats.rx_bytes;
+      as.bs.tx_bytes = stats.tx_bytes;
+      as.bs.gets = stats.gets;
+      as.bs.sets = stats.sets;
+      as.bs.get_misses = stats.get_misses;
+      as.bs.start = stats.start;
+      as.bs.stop = stats.stop;
+      as.bs.skips = stats.skips;
 
-    req = s_recv(socket);
-    request.rebuild(options.n_intervals * sizeof(uint64_t));
-    memcpy(request.data(), as.get_sum_sq, options.n_intervals * sizeof(double));
-    socket.send(request);
+      for (int j = 0; j < options.n_intervals; j++) {
+        as.gets_dyn[j] = stats.gets_dyn[j];
+        as.sets_dyn[j] = stats.sets_dyn[j];
+      }
 
-    // std::cout << "SENDING" << std::endl;
-    // as.print_base();
-    // as.print_dyn();
-    // as.print_bins();
-    // as.print_sum();
+      for (int j = 0; j < options.n_intervals; j++) {
+        for (int k = 0; k < LOGSAMPLER_BINS; k++) {
+          as.get_bins[j][k] = stats.get_sampler.bins[j][k];
+        }
+        as.get_sum[j] = stats.get_sampler.sum[j];
+        as.get_sum_sq[j] = stats.get_sampler.sum_sq[j];
+      }
+
+      string req = s_recv(socket);
+      request.rebuild(sizeof(as.bs));
+      memcpy(request.data(), &(as.bs), sizeof(as.bs));
+      socket.send(request);
+
+      req = s_recv(socket);
+      request.rebuild(options.n_intervals * sizeof(uint64_t));
+      memcpy(request.data(), as.gets_dyn,
+             options.n_intervals * sizeof(uint64_t));
+      socket.send(request);
+
+      req = s_recv(socket);
+      request.rebuild(options.n_intervals * sizeof(uint64_t));
+      memcpy(request.data(), as.sets_dyn,
+             options.n_intervals * sizeof(uint64_t));
+      socket.send(request);
+
+      for (int j = 0; j < options.n_intervals; j++) {
+        req = s_recv(socket);
+        request.rebuild(LOGSAMPLER_BINS * sizeof(uint64_t));
+        memcpy(request.data(), as.get_bins[j],
+               LOGSAMPLER_BINS * sizeof(uint64_t));
+        socket.send(request);
+      }
+
+      req = s_recv(socket);
+      request.rebuild(options.n_intervals * sizeof(double));
+      memcpy(request.data(), as.get_sum, options.n_intervals * sizeof(double));
+      socket.send(request);
+
+      req = s_recv(socket);
+      request.rebuild(options.n_intervals * sizeof(uint64_t));
+      memcpy(request.data(), as.get_sum_sq,
+             options.n_intervals * sizeof(double));
+      socket.send(request);
 
 #endif
 
-    if (log_level > DEBUG) {
-      stats.print_header(false);
-      printf(" QPS\n");
-      stats.print_stats("read", stats.get_sampler, false);
-      printf(" %8.1f\n", stats.get_qps());
-    }
+      if (log_level > DEBUG) {
+        stats.print_header(false);
+        printf(" QPS\n");
+        stats.print_stats("read", stats.get_sampler, false);
+        printf(" %8.1f\n", stats.get_qps());
+      }
 
-    if (options.dyn_agent) {
-      delete[] options.qps_dyn;
-      delete[] options.lambda_dyn;
+      if (options.dyn_agent) {
+        delete[] options.qps_dyn;
+        delete[] options.lambda_dyn;
+      }
+    } catch (const zmq::error_t &e) {
+      if (e.num() == EINTR) {
+        break;
+      } else {
+        throw;
+      }
     }
   }
 }
@@ -1429,6 +1389,12 @@ void *thread_main(void *arg) {
   return cs;
 }
 
+void check_state_cb(evutil_socket_t fd, short events, void *arg) {
+  if (!keep_running) {
+    event_base_loopbreak((struct event_base *)arg);
+  }
+}
+
 void do_mcperf(const vector<string> &servers, options_t &options,
                ConnectionStats &stats, bool master
 #ifdef HAVE_LIBZMQ
@@ -1439,7 +1405,7 @@ void do_mcperf(const vector<string> &servers, options_t &options,
   int loop_flag =
       (options.blocking || args.blocking_given) ? EVLOOP_ONCE : EVLOOP_NONBLOCK;
 
-  char *saveptr = NULL; // For reentrant strtok().
+  char *saveptr = NULL;
 
   struct event_base *base;
   struct evdns_base *evdns;
@@ -1456,14 +1422,14 @@ void do_mcperf(const vector<string> &servers, options_t &options,
   if ((base = event_base_new_with_config(config)) == NULL)
     DIE("event_base_new() fail");
 
-  //  evthread_use_pthreads();
-
   if ((evdns = evdns_base_new(base, 1)) == 0)
     DIE("evdns");
 
-  //  event_base_priority_init(base, 2);
+  struct event *timer_ev =
+      event_new(base, -1, EV_PERSIST, check_state_cb, base);
+  struct timeval tv = {0, 200000};
+  evtimer_add(timer_ev, &tv);
 
-  // FIXME: May want to move this to after all connections established.
   double start = get_time();
   double now = start;
 
@@ -1472,7 +1438,6 @@ void do_mcperf(const vector<string> &servers, options_t &options,
   vector<string>::const_iterator s;
 
   for (s = servers.begin(); s != servers.end(); s++) {
-    // Split args.server_arg[s] into host:port using strtok().
     char *s_copy = new char[s->length() + 1];
     strcpy(s_copy, s->c_str());
 
@@ -1491,11 +1456,8 @@ void do_mcperf(const vector<string> &servers, options_t &options,
 
     int conns = args.measure_connections_given ? args.measure_connections_arg
                                                : options.connections;
-    D("Connections req %s %d [%d/%d]", s->c_str(), conns,
-      args.measure_connections_arg, options.connections);
 
     for (int c = 0; c < conns; c++) {
-
       Connection *conn = new Connection(
           base, evdns, hostname, port, options,
           args.agentmode_given ? true : true,
@@ -1508,17 +1470,12 @@ void do_mcperf(const vector<string> &servers, options_t &options,
     }
   }
 
-  // Wait for all Connections to become IDLE.
   int lcntr = 0;
   struct timeval delay;
-  // SG setup auto exit from evloop to break potential deadlock
   delay.tv_sec = 4;
   delay.tv_usec = 0;
 
-  D("evt based loop start\n");
   while (keep_running) {
-    // FIXME: If all connections become ready before event_base_loop
-    // is called, this will deadlock.
     event_base_loopexit(base, &delay);
     event_base_loop(base, EVLOOP_ONCE);
 
@@ -1531,30 +1488,19 @@ void do_mcperf(const vector<string> &servers, options_t &options,
         restart = true;
       }
       cid++;
-      if ((lcntr & 0x3f) == 0) {
-        V("evt based loop [%d] taking long time. read state=%d/%d", lcntr,
-          (*conn)->read_state, cid);
-      }
     }
     if (restart && keep_running)
       continue;
     else
       break;
   }
-  D("evt based loop end\n");
 
-  // Load database on lead connection for each server.
-  // TODO: parallelize the database loading to multiple threads
   if (!options.noload) {
-    D("Loading database.");
     vector<Connection *>::iterator c;
     for (c = server_lead.begin(); c != server_lead.end(); c++)
       (*c)->start_loading();
 
-    // Wait for all Connections to become IDLE.
-    while (1) {
-      // FIXME: If all connections become ready before event_base_loop
-      // is called, this will deadlock.
+    while (keep_running) {
       event_base_loopexit(base, &delay);
       event_base_loop(base, EVLOOP_ONCE);
 
@@ -1565,7 +1511,7 @@ void do_mcperf(const vector<string> &servers, options_t &options,
           restart = true;
         }
 
-      if (restart)
+      if (restart && keep_running)
         continue;
       else
         break;
@@ -1573,43 +1519,27 @@ void do_mcperf(const vector<string> &servers, options_t &options,
   }
 
   if (options.loadonly) {
+    event_free(timer_ev);
     evdns_base_free(evdns, 0);
     event_base_free(base);
     return;
   }
 
-  // FIXME: Remove.  Not needed, testing only.
-  //  // FIXME: Synchronize start_time here across threads/nodes.
-  //  pthread_barrier_wait(&barrier);
-
-  // Warmup connection.
   if (options.warmup > 0) {
-    if (master)
-      V("Warmup start.");
-
 #ifdef HAVE_LIBZMQ
     if (args.agent_given || args.agentmode_given) {
-      if (master)
-        V("Synchronizing.");
-
-      // 1. thread barrier: make sure our threads ready before syncing agents
-      // 2. sync agents: all threads across all agents are now ready
-      // 3. thread barrier: don't release our threads until all agents ready
       int err = 0;
       pthread_barrier_wait(&barrier);
       if (master)
         err = sync_agent(socket);
       pthread_barrier_wait(&barrier);
 
-      if (master)
-        V("Synchronized.");
       if (err > 0)
         DIE("ERROR during synchronization! %s:%d", __FILE__, __LINE__);
     }
 #endif
 
     int old_time = options.time;
-    //    options.time = 1;
 
     start = get_time();
     vector<Connection *>::iterator iconn;
@@ -1618,19 +1548,15 @@ void do_mcperf(const vector<string> &servers, options_t &options,
 
       conn->start_time = start;
       conn->options.time = options.warmup;
-      conn->drive_write_machine(); // Kick the Connection into motion.
+      conn->drive_write_machine();
     }
 
-    while (1) {
+    while (keep_running) {
       event_base_loop(base, loop_flag);
 
-      // #ifdef USE_CLOCK_GETTIME
-      //       now = get_time();
-      // #else
       struct timeval now_tv;
       event_base_gettimeofday_cached(base, &now_tv);
       now = tv_to_double(&now_tv);
-      // #endif
 
       bool restart = false;
       vector<Connection *>::iterator iconn;
@@ -1640,7 +1566,7 @@ void do_mcperf(const vector<string> &servers, options_t &options,
           restart = true;
       }
 
-      if (restart)
+      if (restart && keep_running)
         continue;
       else
         break;
@@ -1654,14 +1580,8 @@ void do_mcperf(const vector<string> &servers, options_t &options,
     }
 
     if (restart) {
-
-      // Wait for all Connections to become IDLE.
-      while (1) {
-        // FIXME: If there were to use EVLOOP_ONCE and all connections
-        // become ready before event_base_loop is called, this will
-        // deadlock.  We should check for IDLE before calling
-        // event_base_loop.
-        event_base_loop(base, EVLOOP_ONCE); // EVLOOP_NONBLOCK);
+      while (keep_running) {
+        event_base_loop(base, EVLOOP_ONCE);
 
         bool restart = false;
         vector<Connection *>::iterator iconn;
@@ -1671,64 +1591,45 @@ void do_mcperf(const vector<string> &servers, options_t &options,
             restart = true;
         }
 
-        if (restart)
+        if (restart && keep_running)
           continue;
         else
           break;
       }
     }
 
-    //    options.time = old_time;
     for (iconn = connections.begin(); iconn != connections.end(); iconn++) {
       Connection *conn = *iconn;
       conn->reset();
-      //      conn->stats = ConnectionStats();
       conn->options.time = old_time;
     }
-
-    if (master)
-      V("Warmup stop.");
   }
 
-  // FIXME: Synchronize start_time here across threads/nodes.
   pthread_barrier_wait(&barrier);
 
   if (master && args.wait_given) {
     if (get_time() < boot_time + args.wait_arg) {
       double t = (boot_time + args.wait_arg) - get_time();
-      V("Sleeping %.1fs for -W.", t);
       sleep_time(t);
     }
   }
 
 #ifdef HAVE_LIBZMQ
   if (args.agent_given || args.agentmode_given) {
-    if (master)
-      V("Synchronizing.");
-
     int err = 0;
     pthread_barrier_wait(&barrier);
     if (master)
       err = sync_agent(socket);
     pthread_barrier_wait(&barrier);
 
-    if (master)
-      V("Synchronized.");
     if (err > 0)
       DIE("ERROR during synchronization! %s:%d", __FILE__, __LINE__);
   }
 #endif
 
-  if (master && !args.scan_given && !args.search_given)
-    V("started at %f", get_time());
-
   start = get_time();
 
   if (args.trace_given) {
-    /* 	To support tracing/simulation, in trace mode,
-            send special start_trace/stop_trace commands to the server,
-            and at end of test, kill the server.
-    */
     Connection *conn = *connections.begin();
     conn->issue_command(command_string[0]);
   }
@@ -1736,22 +1637,15 @@ void do_mcperf(const vector<string> &servers, options_t &options,
   for (iconn = connections.begin(); iconn != connections.end(); iconn++) {
     Connection *conn = *iconn;
     conn->start_time = start;
-    conn->drive_write_machine(); // Kick the Connection into motion.
+    conn->drive_write_machine();
   }
 
-  //  V("Start = %f", start);
-
-  // Main event loop.
-  while (1) {
+  while (keep_running) {
     event_base_loop(base, loop_flag);
 
-    // #if USE_CLOCK_GETTIME
-    //     now = get_time();
-    // #else
     struct timeval now_tv;
     event_base_gettimeofday_cached(base, &now_tv);
     now = tv_to_double(&now_tv);
-    // #endif
 
     bool restart = false;
     vector<Connection *>::iterator iconn;
@@ -1761,7 +1655,7 @@ void do_mcperf(const vector<string> &servers, options_t &options,
         restart = true;
     }
 
-    if (restart)
+    if (restart && keep_running)
       continue;
     else
       break;
@@ -1769,17 +1663,11 @@ void do_mcperf(const vector<string> &servers, options_t &options,
 
   if (master && !args.scan_given && !args.search_given)
     if (args.trace_given) {
-      /* 	To support tracing/simulation, in trace mode,
-              send special start_trace/stop_trace commands to the server,
-              and at end of test, kill the server.
-      */
       Connection *conn = *connections.begin();
       conn->issue_command(command_string[1]);
       conn->issue_command(command_string[2]);
     }
-  V("stopped at %f  options.time = %d", get_time(), options.time);
 
-  // Tear-down and accumulate stats.
   for (iconn = connections.begin(); iconn != connections.end(); iconn++) {
     Connection *conn = *iconn;
     stats.accumulate(conn->stats);
@@ -1789,6 +1677,7 @@ void do_mcperf(const vector<string> &servers, options_t &options,
   stats.start = start;
   stats.stop = now;
 
+  event_free(timer_ev);
   event_config_free(config);
   evdns_base_free(evdns, 0);
   event_base_free(base);
